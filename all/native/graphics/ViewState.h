@@ -66,6 +66,17 @@ namespace massif {
          * the focus, as in mapbox, rather than to sea level.
          */
         void liftFocus(double deltaZ);
+        /**
+         * Put the focus at `internalZ` above the surface, carrying the camera with it. Through the
+         * projection surface, so it is a radial move on a globe and a z move on a plane.
+         */
+        void setFocusHeight(double internalZ);
+        /**
+         * World units per internal unit AT THE FOCUS: 1 on the plane, and on the globe
+         * `2 * cos(latitude)` ramping back to 2 as the planet fills the view. The camera calibrates
+         * on it, so the same zoom frames the same ground on either surface.
+         */
+        double worldPerInternal() const;
 
         /**
          * Returns the up direction vector.
@@ -484,7 +495,8 @@ namespace massif {
          * One function because it is computed in two places, and a zoom convention that holds in
          * only one of them is worse than none.
          */
-        double calculateZoom0Distance(double tanHalfFOVY) const;
+        double localWorldPerInternal(const std::shared_ptr<ProjectionSurface>& projectionSurface) const;
+        double calculateZoom0Distance(double tanHalfFOVY, const std::shared_ptr<ProjectionSurface>& projectionSurface) const;
         MapPos calculateMapBoundsCenter(const Options& options, const MapBounds& mapBounds) const;
    
         cglib::mat4x4<double> calculatePerspMat(float halfFOVY, float near, float far, const Options& options) const;

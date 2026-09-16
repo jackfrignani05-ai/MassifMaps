@@ -717,6 +717,10 @@ namespace massif::vt {
         void blendScreenTexture(float opacity, GLuint texture);
         void updateTerrainSkirts();
         const std::pair<bool, TerrainTexture>& resolveTerrainTexture(const TileId& tileId) const;
+        bool terrainGridSurfaces() const;
+        double sphereWorldRadius() const;
+        cglib::vec2<double> sphereFrameMercator(const cglib::mat4x4<double>& vertexFrameMatrix) const;
+        void setupSphericalUniforms(const ShaderProgram& shaderProgram, const TileId& tileId, const cglib::mat4x4<double>& vertexFrameMatrix);
         bool setupTerrainUniforms(const ShaderProgram& shaderProgram, const TileId& tileId, const cglib::mat4x4<double>& vertexFrameMatrix, bool gridSurface = false);
         // The tile set the terrain SURFACES are drawn from this frame, which is not the renderer's own
         // visible tiles as soon as a cover is handed in. Edge stitching has to follow the DRAWN cover,
@@ -754,7 +758,7 @@ namespace massif::vt {
          * @return False when the point is not on a resolved span.
          */
         void markPendingLabelsDirty();
-        std::function<double(const cglib::vec3<double>&)> labelHeightFunc() const;
+        std::function<cglib::vec3<double>(const cglib::vec3<double>&)> labelAnchorFunc() const;
         bool anchorDirtyLabels();
         bool spanHeightAt(const cglib::vec2<double>& pos, double& height) const;
         void renderTileMask(const TileId& tileId);
@@ -799,6 +803,7 @@ namespace massif::vt {
         // handed to the uniform setup, so the program flags and the uniforms cannot disagree.
         struct GeometryDrawMode {
             bool flatDrape = false;
+            bool sphericalDrape = false; // a bake on a sphere: the shader places the vertex in the tile
             bool terrainVTF = false;
             bool shadowReceiver = false;
             bool terrainLit = false;
@@ -818,6 +823,7 @@ namespace massif::vt {
         const CompiledBitmap& buildCompiledTileBitmap(const std::shared_ptr<TileBitmap>& tileBitmap);
         const CompiledGeometry* buildCompiledTileGeometry(const std::shared_ptr<TileGeometry>& tileGeometry);
         // id must be a string LITERAL: its address is the identity in the front cache below.
+        void bindSurfaceSkirtAttrib(const ShaderProgram& shaderProgram, const TileSurface::VertexGeometryLayoutParameters& vertexGeomLayoutParams);
         const ShaderProgram& buildShaderProgram(const char* id, const std::string& vsh, const std::string& fsh, LightingMode lightingMode, RasterFilterMode filterMode, unsigned int flags);
         const std::vector<std::shared_ptr<TileSurface>>& buildCompiledTerrainGridSurfaces();
         // Two triangles covering the tile square. The drape bake is flat and orthographic, so the
@@ -908,6 +914,7 @@ namespace massif::vt {
         cglib::vec4<float> _drapeMaskUVTransform; // ... and target-tile units -> that mask's units
         const cglib::mat4x4<double>* _shadowCasterViewProj = nullptr; // set during the shadow caster pass
         const cglib::mat4x4<float>* _drapeMVPOverride = nullptr; // when set, renderTileGeometry draws flat into the drape FBO
+        std::array<GLfloat, 9> _sphereLightingFrame = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }; // world -> the view's east/north/up
         bool _debugWireframe = false;
         bool _debugTileBorders = false;
         GLuint _tileBorderVBO = 0;               // the tile outline, in tile-local coordinates

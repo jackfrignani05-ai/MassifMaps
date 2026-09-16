@@ -111,17 +111,46 @@ namespace massif {
         if (!_terrainCameraBound || !(_zoom0Distance > 0)) {
             return std::numeric_limits<float>::infinity();
         }
-        return CameraClearance::maxZoom(_zoom, _focusPos(2), _cameraPos(2), _terrainCameraZ,
-                                        getOrbitDistance(_zoomRange.getMax()), _terrainClearanceFloor);
+        // Heights are INTERNAL and an orbit is a WORLD distance: on a globe those differ by 2.
+        double worldPerInternalZ = worldPerInternal();
+        double focusZ = (_projectionSurface ? _projectionSurface->calculateMapPos(_focusPos).getZ() : _focusPos(2));
+        double cameraZ = (_projectionSurface ? _projectionSurface->calculateMapPos(_cameraPos).getZ() : _cameraPos(2));
+        return CameraClearance::maxZoom(_zoom, focusZ, cameraZ, _terrainCameraZ,
+                                        getOrbitDistance(_zoomRange.getMax()) / worldPerInternalZ, _terrainClearanceFloor);
     }
 
     float ViewState::getRenderZoom() const {
         return static_cast<float>(ZoomConvention::renderZoom(_zoom, _zoomOffset));
     }
 
-    double ViewState::calculateZoom0Distance(double tanHalfFOVY) const {
-        return ZoomConvention::zoom0Distance(_height, Const::WORLD_SIZE, _tileDrawSize, _zoomOffset,
+    double ViewState::calculateZoom0Distance(double tanHalfFOVY, const std::shared_ptr<ProjectionSurface>& projectionSurface) const {
+        // The SURFACE's world, not the planar constant: a sphere's equator is twice as wide, so
+        // calibrating on WORLD_SIZE put the globe's camera at half the distance its zoom means -
+        // everything a zoom level too large, and the camera inside the relief by zoom 12.
+        // The surface comes in rather than off the member: on the frame the projection CHANGES the
+        // member is still the old one, and reading it there made the globe jump a zoom on startup.
+        return ZoomConvention::zoom0Distance(_height, Const::WORLD_SIZE * localWorldPerInternal(projectionSurface), _tileDrawSize, _zoomOffset,
                                              tanHalfFOVY, _dpi / Const::UNSCALED_DPI);
+    }
+
+    double ViewState::localWorldPerInternal(const std::shared_ptr<ProjectionSurface>& projectionSurface) const {
+        if (!projectionSurface) {
+            return 1.0;
+        }
+        double equator = projectionSurface->getWorldWidth() / Const::WORLD_SIZE;
+        double local = projectionSurface->calculateLocalScale(_focusPos);
+        if (!(local > 0) || local == equator) {
+            return equator; // a plane answers the same scale everywhere and never reaches the ramp
+        }
+        // The LOCAL scale is what makes a zoom frame the same ground as the plane's, but only while
+        // the view is a patch. Ramp back to the equatorial one as the planet fills the frame, or a
+        // cos(85 deg) camera at world view sits 11x too close. The ramp is the ORBIT against the
+        // planet's own radius - a zoom threshold would be a screen size and a DPI in disguise.
+        double radius = projectionSurface->getWorldWidth() / (2 * Const::PI);
+        double orbit = ZoomConvention::zoom0Distance(_height, projectionSurface->getWorldWidth(), _tileDrawSize, _zoomOffset,
+                                                     _tanHalfFOVY, _dpi / Const::UNSCALED_DPI) / std::pow(2.0, static_cast<double>(_zoom));
+        double t = (radius > 0 ? std::max(0.0, std::min(1.0, (4 * radius - orbit) / (3 * radius))) : 1.0);
+        return equator + (local - equator) * t;
     }
 
     double ViewState::getOrbitDistance(float zoom) const {
@@ -157,6 +186,28 @@ namespace massif {
         _cameraChanged = true;
     }
     
+    void ViewState::setFocusHeight(double internalZ) {
+        if (!_projectionSurface || !std::isfinite(internalZ)) {
+            return;
+        }
+        MapPos focusMapPos = _projectionSurface->calculateMapPos(_focusPos);
+        if (focusMapPos.getZ() == internalZ) {
+            return;
+        }
+        cglib::vec3<double> focusPos = _projectionSurface->calculatePosition(MapPos(focusMapPos.getX(), focusMapPos.getY(), internalZ));
+        cglib::vec3<double> delta = focusPos - _focusPos;
+        if (!std::isfinite(cglib::norm(delta))) {
+            return;
+        }
+        _focusPos = focusPos;
+        _cameraPos = _cameraPos + delta;
+        _cameraChanged = true;
+    }
+
+    double ViewState::worldPerInternal() const {
+        return localWorldPerInternal(_projectionSurface);
+    }
+
     const cglib::vec3<double>& ViewState::getUpVec() const {
         return _upVec;
     }
@@ -568,7 +619,7 @@ namespace massif {
             _tanHalfFOVX = _aspectRatio * _tanHalfFOVY;
             _cosHalfFOVXY = std::cos(std::atan(_tanHalfFOVX)) * _cosHalfFOVY;
 
-            _zoom0Distance = static_cast<float>(calculateZoom0Distance(_tanHalfFOVY));
+            _zoom0Distance = static_cast<float>(calculateZoom0Distance(_tanHalfFOVY, projectionSurface));
             _minZoom = zoomRange.getMin();
             _zoomRange = zoomRange;
             _restrictedPanning = restrictedPanning;
@@ -615,6 +666,19 @@ namespace massif {
             }
 
             _cameraChanged = true;
+        }
+
+        // The calibration follows the FOCUS on a globe (see localWorldPerInternal), so the distance
+        // a zoom means changes as the map is panned in latitude. A plane answers the same number
+        // every time and never enters this.
+        if (_projectionSurface && _zoom0Distance > 0) {
+            double zoom0Distance = calculateZoom0Distance(_tanHalfFOVY, _projectionSurface);
+            if (zoom0Distance > 0 && std::abs(zoom0Distance - _zoom0Distance) > _zoom0Distance * 1.0e-4) {
+                _zoom0Distance = static_cast<float>(zoom0Distance);
+                double length = _zoom0Distance / std::pow(2.0, static_cast<double>(_zoom));
+                _cameraPos = _focusPos + cglib::unit(_cameraPos - _focusPos) * length;
+                _cameraChanged = true;
+            }
         }
 
         if (_cameraChanged) {
@@ -758,7 +822,7 @@ namespace massif {
     void ViewState::calculateViewDistances(const Options& options, float& near, float& far, bool& skyVisible, float& skyHorizonNDC) const {
         float halfFOVY = options.getFieldOfViewY() * 0.5f;
         float tanHalfFOVY = std::tan(static_cast<float>(halfFOVY * Const::DEG_TO_RAD));
-        float zoom0Distance = static_cast<float>(calculateZoom0Distance(tanHalfFOVY));
+        float zoom0Distance = static_cast<float>(calculateZoom0Distance(tanHalfFOVY, _projectionSurface));
         float initialZ = std::pow(2.0f, -_zoom) * zoom0Distance / 64.0f;
         // The direction the camera actually looks along, which above the horizon is not the
         // direction of the focus point (calculateLookatMat).

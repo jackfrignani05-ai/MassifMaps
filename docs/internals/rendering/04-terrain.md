@@ -451,9 +451,21 @@ that interpolates — is baked in at whatever zoom the tile was first baked at, 
 a new tile level happened to bring new textures. A road stepped once per integer level instead of
 growing with the zoom.
 
-The zoom now goes into the fingerprint quantised (`DrapeTuning::bakeZoomTerm`), at the same quarter
-of a level the label re-placement uses: four bakes per zoom level, spread over frames by the bake
-budget above. The term follows the camera **only once it settles** — mapbox does the same, their
+**The scene LIGHT is content too**, for the same reason: it is baked in with the colours, so moving
+the sun has to make the cover stale or the buildings follow the hour and the ground does not. It is
+quantised to `DRAPE_LIGHT_STEPS` per channel — **16**, not the 64 it started at. Every step the sun
+crosses re-bakes the whole cover, and at 64 a day-cycle drag crossed one every few frames: the
+ground repainted continuously, always a few frames behind the buildings. Sixteen steps is still
+finer than a drape tile's own colour resolution and re-bakes a quarter as often.
+
+The count ration on that class is gone **at rest**. One stale tile per frame is right while the
+camera moves, but a light step marks the whole cover at once with the camera still, and a count
+repaints it tile by tile in front of the user — the ground visibly trailing the sky. At rest the
+60 ms wall-clock ceiling rations it instead, which is what it was written for.
+
+The zoom goes into the fingerprint quantised the same way (`DrapeTuning::bakeZoomTerm`), at the same
+quarter of a level the label re-placement uses: four bakes per zoom level, spread over frames by the
+bake budget above. The term follows the camera **only once it settles** — mapbox does the same, their
 drape does not re-render during a pinch — because re-baking mid-gesture spends a bake per tile per
 step on a picture that is about to change again. The frame the term moves in has to be asked for
 explicitly (`requestRedraw`); nothing else was going to draw it.
@@ -1036,6 +1048,32 @@ Because the shell then MOVES with the camera, the lift is a fixed point
 terrainZ + floor) - focusZ`) and not `terrainZ + minHeight`: rising raises the clearance it has to
 clear, and a lift that ignores that under-shoots every frame. Both the lift and the zoom bound read
 the same shell, so they cannot disagree.
+
+**The camera is held on the shell by the FOCUS, not by a tilt.** The per-frame correction used to
+raise the camera by tilting it up (and by zooming out past the tilt range), which the user reads as
+the view jumping - "the tilt suddenly changed to 54". `CameraClearance::shellCameraZ` is the camera
+height the shell asks for over the ground under the camera, and it does not depend on the focus,
+which is exactly what lets the focus be raised to satisfy it: the camera keeps the tilt and the
+zoom it was given and rises vertically. The zoom BOUND (`getTerrainMaxZoom`) stays - it stops a
+zoom from driving the camera into the ground in the first place.
+`TerrainOptions::CameraClampDuration` animated that correction and no longer has anything to
+animate.
+
+**The focus follows the ground only NEAR the shell**, which is a second divergence.
+mapbox pins the centre to the terrain at every altitude (`_centerAltitude`), and because the lift
+carries the camera with it, a pan across a ridge lifted the whole view - the map visibly bobbing
+from far above the ground, which is what the previous paragraph's tilt fix only halved.
+`CameraClearance::focusFollow` ramps it instead: the full ground height at the shell, none of it
+`FOLLOW_BAND` (4) shells above, linear between. Everything feeding the ramp is measured with the
+focus PINNED - the lift moves the camera, so a ramp fed the CURRENT height would drive its own
+input and oscillate.
+
+**Both work on the globe too.** They read a camera or focus position through
+`ProjectionSurface::calculateMapPos`, so a sphere's 3D point becomes the internal x/y an elevation
+lookup wants and the height above the surface; `ViewState::setFocusHeight` puts the focus back
+through `calculatePosition`, which is radial there and a z move on the plane. The one trap is that
+an ORBIT is a world distance while a height is an internal one, and those differ by 2 on a sphere
+([18-globe.md](18-globe.md)) - `ViewState::worldPerInternal` is the conversion.
 
 It is a
 **bound on the zoom** (`ViewState::getTerrainMaxZoom`, clamped in `CameraZoomEvent::calculate`),

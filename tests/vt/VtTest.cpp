@@ -24,6 +24,7 @@ void testExtrusionEmissive();
 void testExtrusionGroupAnchor();
 void testSpanDrapeLight();
 void testSpanResolver();
+void testSphericalTerrain();
 void testCollisionPadding();
 void testLabelAnchorAlign();
 void testLabelPadding();
@@ -52,6 +53,7 @@ int main() {
     testExtrusionGroupAnchor();
     testSpanDrapeLight();
     testSpanResolver();
+    testSphericalTerrain();
     testCollisionPadding();
     testLabelAnchorAlign();
     testLabelPadding();

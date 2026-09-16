@@ -784,11 +784,14 @@ namespace massif {
         _maxVisibleDistance = 0;
         {
             StyleEnvironment env;
-            if (auto options = getOptions()) {
+            std::shared_ptr<Options> options = getOptions();
+            if (options) {
                 _maxVisibleDistance = cullState->getViewState().calculateViewDistance(*options);
             }
             if (getStyleEnvironment(cullState->getViewState(), env) && env.terrainMaxVisibleDistance && *env.terrainMaxVisibleDistance > 0) {
-                _maxVisibleDistance = std::max(_maxVisibleDistance, *env.terrainMaxVisibleDistance * static_cast<double>(Const::WORLD_SIZE) / Const::EARTH_CIRCUMFERENCE);
+                // Metres to WORLD units, which is the surface's own world - twice as wide on a globe.
+                double worldWidth = (options && options->getProjectionSurface() ? options->getProjectionSurface()->getWorldWidth() : static_cast<double>(Const::WORLD_SIZE));
+                _maxVisibleDistance = std::max(_maxVisibleDistance, *env.terrainMaxVisibleDistance * worldWidth / Const::EARTH_CIRCUMFERENCE);
             }
         }
 
@@ -797,7 +800,13 @@ namespace massif {
         if (_terrainMinTileZoom > 0 && _maxVisibleDistance > 0) {
             // Tiles across the covered ground, worst case (a square of side 2 * distance):
             //     (2 * distance / tileWidth)^2 <= budget,   tileWidth = WORLD_SIZE / 2^zoom
-            double maxTileZoom = std::log2(Const::WORLD_SIZE * std::sqrt(static_cast<double>(TERRAIN_COVER_TILE_BUDGET)) / (2 * _maxVisibleDistance));
+            double coverWorldWidth = static_cast<double>(Const::WORLD_SIZE);
+            if (auto budgetOptions = getOptions()) {
+                if (auto surface = budgetOptions->getProjectionSurface()) {
+                    coverWorldWidth = surface->getWorldWidth(); // a tile is this wide over 2^zoom, on either surface
+                }
+            }
+            double maxTileZoom = std::log2(coverWorldWidth * std::sqrt(static_cast<double>(TERRAIN_COVER_TILE_BUDGET)) / (2 * _maxVisibleDistance));
             int budgetMinTileZoom = static_cast<int>(std::floor(maxTileZoom));
             if (budgetMinTileZoom < _terrainMinTileZoom) {
                 if (_terrainMinTileZoom - budgetMinTileZoom > 1) {
@@ -862,6 +871,15 @@ namespace massif {
             }
         }
         
+        {
+            static int pr = 0;
+            if ((pr++ % 1) == 0) {
+                int minZ = 99, maxZ = -1;
+                for (const MapTile& t : _visibleTiles) { minZ = std::min(minZ, t.getZoom()); maxZ = std::max(maxZ, t.getZoom()); }
+                Log::Infof("PROBE cull layer %p visible %d (zoom %d..%d) preload %d, maxVisDist %.1f, lodMaxArea %.1f, targetZoom %d, terrainMinZoom %d, tilt %.1f",
+                    (void*)this, (int)_visibleTiles.size(), minZ, maxZ, (int)_preloadingTiles.size(), _maxVisibleDistance, _lodMaxTileArea, _targetTileZoom, _terrainMinTileZoom, cullState->getViewState().getTilt());
+            }
+        }
         sortTiles(_visibleTiles, cullState->getViewState(), false);
         sortTiles(_labelTiles, cullState->getViewState(), true);
         sortTiles(_preloadingTiles, cullState->getViewState(), true);
@@ -922,36 +940,52 @@ namespace massif {
         }
         double screenArea = std::numeric_limits<double>::infinity();
         {
-            static const cglib::vec3<double> CORNERS[4] = {
-                cglib::vec3<double>(0, 0, 0), cglib::vec3<double>(1, 0, 0),
-                cglib::vec3<double>(1, 1, 0), cglib::vec3<double>(0, 1, 0)
-            };
-            cglib::vec2<double> screenPos[4];
+            // The tile's own surface, through the vertex transformer: tile-local xy is the unit
+            // square only on a plane, and on a sphere the matrix alone sent the corners off the
+            // surface - the projected area was then meaningless and tiles refined far too late.
+            // A sphere needs the INTERIOR too: a coarse tile's four corners land on top of each
+            // other (the root's are all on the antimeridian) and enclose no area at all, so nothing
+            // ever subdivided. Summing a 3x3 grid's cells is the same number on a plane.
+            std::shared_ptr<const vt::TileTransformer::VertexTransformer> vertexTransformer = tileTransformer->createTileVertexTransformer(vtTileId);
+            const int steps = (tileTransformer->isSpherical() ? 3 : 2);
+            cglib::vec2<double> screenPos[3][3];
             bool projected = true;
-            for (int i = 0; i < 4; i++) {
-                cglib::vec3<double> worldPos = cglib::transform_point(CORNERS[i], tileMat);
-                worldPos(2) += lodElevation;
-                cglib::vec4<double> clipPos = cglib::transform(cglib::vec4<double>(worldPos(0), worldPos(1), worldPos(2), 1.0), mvpMat);
-                if (!(clipPos(3) > 0)) {
-                    projected = false;
-                    break;
+            for (int j = 0; j < steps && projected; j++) {
+                for (int i = 0; i < steps; i++) {
+                    cglib::vec2<float> uv(static_cast<float>(i) / (steps - 1), static_cast<float>(j) / (steps - 1));
+                    cglib::vec3<double> worldPos = cglib::transform_point(cglib::vec3<double>::convert(vertexTransformer->calculatePoint(uv)), tileMat);
+                    worldPos = tileTransformer->calculateElevatedPos(worldPos, lodElevation);
+                    cglib::vec4<double> clipPos = cglib::transform(cglib::vec4<double>(worldPos(0), worldPos(1), worldPos(2), 1.0), mvpMat);
+                    if (!(clipPos(3) > 0)) {
+                        projected = false;
+                        break;
+                    }
+                    screenPos[j][i] = cglib::vec2<double>(clipPos(0) / clipPos(3) * viewState.getHalfWidth(), clipPos(1) / clipPos(3) * viewState.getHalfHeight());
                 }
-                screenPos[i] = cglib::vec2<double>(clipPos(0) / clipPos(3) * viewState.getHalfWidth(), clipPos(1) / clipPos(3) * viewState.getHalfHeight());
             }
             if (projected) {
                 double area = 0;
-                for (int i = 0; i < 4; i++) {
-                    const cglib::vec2<double>& p = screenPos[i];
-                    const cglib::vec2<double>& q = screenPos[(i + 1) % 4];
-                    area += p(0) * q(1) - q(0) * p(1);
+                for (int j = 0; j + 1 < steps; j++) {
+                    for (int i = 0; i + 1 < steps; i++) {
+                        const cglib::vec2<double>* cell[4] = { &screenPos[j][i], &screenPos[j][i + 1], &screenPos[j + 1][i + 1], &screenPos[j + 1][i] };
+                        double cellArea = 0;
+                        for (int k = 0; k < 4; k++) {
+                            const cglib::vec2<double>& p = *cell[k];
+                            const cglib::vec2<double>& q = *cell[(k + 1) % 4];
+                            cellArea += p(0) * q(1) - q(0) * p(1);
+                        }
+                        area += std::abs(cellArea) * 0.5;
+                    }
                 }
-                screenArea = std::abs(area) * 0.5;
+                screenArea = area;
                 // The area already carries one power of cos(incidence); maplibre's rule wants p of
                 // them, so the exponent applied here is p - 1 and 0 leaves the area rule alone.
                 if (_lodCosThetaExponent != 0) {
-                    cglib::vec3<double> toTile = tileCenter + cglib::vec3<double>(0, 0, lodElevation) - viewState.getCameraPos();
-                    double dist = cglib::length(toTile);
-                    double cosTheta = dist > 0 ? std::abs(toTile(2)) / dist : 1.0;
+                    // Against the tile's own UP, which is the z axis only on a plane.
+                    cglib::vec3<double> up = cglib::vec3<double>::convert(vertexTransformer->calculateNormal(cglib::vec2<float>(0.5f, 0.5f)));
+                    cglib::vec3<double> toTile = tileTransformer->calculateElevatedPos(tileCenter, lodElevation) - viewState.getCameraPos();
+                    double dist = cglib::length(toTile) * cglib::length(up);
+                    double cosTheta = dist > 0 ? std::abs(cglib::dot_product(toTile, up)) / dist : 1.0;
                     if (cosTheta > 0) {
                         screenArea *= std::pow(cosTheta, _lodCosThetaExponent);
                     }
@@ -1338,22 +1372,24 @@ namespace massif {
 
     void TileLayer::resetTileTransformer() {
         std::shared_ptr<vt::TileTransformer> tileTransformer;
+        std::shared_ptr<vt::TileTransformer> base;
         if (auto options = getOptions()) {
-            if (options->getRenderProjectionMode() == RenderProjectionMode::RENDER_PROJECTION_MODE_SPHERICAL) {
-                tileTransformer = std::make_shared<vt::SphericalTileTransformer>(static_cast<float>(Const::WORLD_SIZE / Const::PI));
-            }
-            else if (auto terrainOptions = options->getTerrainOptions()) {
+            base = options->getTileTransformer();
+            if (auto terrainOptions = options->getTerrainOptions()) {
                 if (terrainOptions->isDecodeActive()) {
                     // MUST match what calculateDrawData compares against: these decide the
                     // tesselation the cached tiles were built with, so a mismatch leaves tiles
                     // decoded for the other mode in place forever.
                     bool tangramContent = !terrainOptions->isDrapeFillsEnabled();
-                    tileTransformer = std::make_shared<TerrainTileTransformer>(static_cast<float>(Const::WORLD_SIZE), terrainOptions->getElevationManager(), terrainOptions->getMeshResolution(), terrainOptions->getMinZoom(), isAreaSourceDensityForced(), tangramContent || terrainOptions->isDrapeLinesEnabled() || isLineSourceDensityForced());
+                    tileTransformer = std::make_shared<TerrainTileTransformer>(base, terrainOptions->getElevationManager(), terrainOptions->getMeshResolution(), terrainOptions->getMinZoom(), isAreaSourceDensityForced(), tangramContent || terrainOptions->isDrapeLinesEnabled() || isLineSourceDensityForced());
                 }
             }
         }
+        if (!base) {
+            base = std::make_shared<vt::DefaultTileTransformer>(static_cast<float>(Const::WORLD_SIZE));
+        }
         if (!tileTransformer) {
-            tileTransformer = std::make_shared<vt::DefaultTileTransformer>(static_cast<float>(Const::WORLD_SIZE));
+            tileTransformer = base;
         }
         _tileRenderer->setTileTransformer(tileTransformer);
     }

@@ -13,6 +13,7 @@ namespace massif::vt {
         A_VERTEXUV,
         A_VERTEXNORMAL,
         A_VERTEXBINORMAL,
+        A_VERTEXSKIRT,
         A_VERTEXHEIGHT,
         A_VERTEXBASE,
         A_VERTEXCHORD,
@@ -70,6 +71,11 @@ namespace massif::vt {
         U_ELEVATIONLATTICECELL,
         U_ELEVATIONNODETEXTURE,
         U_ELEVATIONNODEUV,
+        U_TERRAINSPHEREORIGIN,
+        U_TERRAINSPHERESCALE,
+        U_TERRAINSPHERENODEUV,
+        U_TERRAINSPHERETILEUV,
+        U_DRAPEBAKE,
         U_ELEVATIONNODETEXELSIZE,
         U_TERRAINEDGECOARSENING,
         U_LAYERDEPTHOFFSET,
@@ -82,6 +88,8 @@ namespace massif::vt {
         U_LIGHTPARAMS,
         U_GROUNDAOPARAMS,
         U_TERRAINSLOPESCALE,
+        U_LIGHTINGFRAME,
+        U_TERRAINSPHEREELEVUV,
         U_SHADOWMATRIX,
         U_SHADOWTEXTURE,
         U_SHADOWPARAMS,
@@ -179,7 +187,12 @@ namespace massif::vt {
         // The shadow receiver is a 3D EXTRUSION, not the ground. An extrusion defends against acne
         // with the normal offset; the ground has no normal and defends with the receiver-plane
         // bias. Each one hurts the other, so the shader has to tell them apart.
-        SHADOW_RECEIVER_3D_FLAG = 536870912
+        SHADOW_RECEIVER_3D_FLAG = 536870912,
+        // The terrain sits on a SPHERE. The displacement then runs along the surface normal instead
+        // of z, and the DEM lookup cannot use tile-local xy, because that is a curved position and
+        // not the tile's unit square. See docs/internals/rendering/18-globe.md.
+        // 1073741824 is deliberately skipped: it is being taken by the DRAPE_MASK_FLAG fix.
+        TERRAIN_SPHERICAL_FLAG = 2147483648u
     };
 
     static const std::map<std::string, int> attribMap = {
@@ -187,6 +200,7 @@ namespace massif::vt {
         { "aVertexUV",       A_VERTEXUV },
         { "aVertexNormal",   A_VERTEXNORMAL },
         { "aVertexBinormal", A_VERTEXBINORMAL },
+        { "aVertexSkirt",    A_VERTEXSKIRT },
         { "aVertexHeight",   A_VERTEXHEIGHT },
         { "aVertexBase",     A_VERTEXBASE },
         { "aVertexChord",    A_VERTEXCHORD },
@@ -244,6 +258,11 @@ namespace massif::vt {
         { "uElevationLatticeCell", U_ELEVATIONLATTICECELL },
         { "uElevationNodeTexture", U_ELEVATIONNODETEXTURE },
         { "uElevationNodeUV",      U_ELEVATIONNODEUV },
+        { "uTerrainSphereOrigin",  U_TERRAINSPHEREORIGIN },
+        { "uTerrainSphereScale",   U_TERRAINSPHERESCALE },
+        { "uTerrainSphereNodeUV",  U_TERRAINSPHERENODEUV },
+        { "uTerrainSphereTileUV",  U_TERRAINSPHERETILEUV },
+        { "uDrapeBake",            U_DRAPEBAKE },
         { "uElevationNodeTexelSize", U_ELEVATIONNODETEXELSIZE },
         { "uTerrainEdgeCoarsening", U_TERRAINEDGECOARSENING },
         { "uLayerDepthOffset",  U_LAYERDEPTHOFFSET },
@@ -256,6 +275,8 @@ namespace massif::vt {
         { "uLightParams",       U_LIGHTPARAMS },
         { "uGroundAOParams",    U_GROUNDAOPARAMS },
         { "uTerrainSlopeScale", U_TERRAINSLOPESCALE },
+        { "uLightingFrame",     U_LIGHTINGFRAME },
+        { "uTerrainSphereElevUV", U_TERRAINSPHEREELEVUV },
         { "uShadowMatrix",      U_SHADOWMATRIX },
         { "uShadowTexture",     U_SHADOWTEXTURE },
         { "uShadowParams",      U_SHADOWPARAMS },
@@ -316,7 +337,8 @@ namespace massif::vt {
         { COVERAGE_FLAG, "COVERAGE" },
         { SPAN_FLAG, "SPAN" },
         { DRAPE_MASK_FLAG, "DRAPE_MASK" },
-        { SPAN_DRAPE_FLAG, "SPAN_DRAPE" }
+        { SPAN_DRAPE_FLAG, "SPAN_DRAPE" },
+        { TERRAIN_SPHERICAL_FLAG, "TERRAIN_SPHERICAL" }
     };
 
     static const std::string textureFiltersFsh = R"GLSL(
@@ -391,6 +413,19 @@ namespace massif::vt {
         #define highp_opt highp
         #else
         #define highp_opt mediump
+        #endif
+        #ifdef TERRAIN_SPHERICAL
+        // World -> the view's own east/north/up. A geometry normal is the SPHERE's on a globe, and
+        // every lighting shader - including an application's own - is written against the map's
+        // frame, where z is up and uSunDir.z is the sun's height (18-globe.md).
+        uniform mediump mat3 uLightingFrame;
+        mediump vec3 lightingNormal(mediump vec3 normal) {
+            return normal * uLightingFrame;
+        }
+        #else
+        mediump vec3 lightingNormal(mediump vec3 normal) {
+            return normal;
+        }
         #endif
         #ifdef TERRAIN_DEPTH_BIAS
         uniform float uDepthBias;     // NDC-constant component (scaled by w)
@@ -488,6 +523,67 @@ namespace massif::vt {
         // uniform referenced without being declared fails the compile.
         uniform highp vec2 uTileUnitScale;
         uniform highp vec2 uTileUnitOffset;
+        #ifdef TERRAIN_SPHERICAL
+        // The unit-sphere point under a vertex: p = origin + pos * scale. Both come off the vertex
+        // frame matrix, which is diagonal-plus-translate in either projection. OUTSIDE the terrain
+        // block: a globe curves its geometry whether or not a DEM is loaded (18-globe.md).
+        uniform highp vec3 uTerrainSphereOrigin;
+        uniform highp vec3 uTerrainSphereScale;
+        // The TARGET tile's own unit square, from Mercator RADIANS: unit = (merc - xy) * zw.
+        // uTileUnitScale's affine form reads a curved xy on a sphere.
+        uniform highp vec4 uTerrainSphereTileUV;
+        // 1 while baking the drape: the target is the tile's unit square, not the world.
+        uniform highp float uDrapeBake;
+        // The unit-sphere point under a vertex, which is both the surface normal and the way back
+        // to Mercator. Reversing SphericalTileTransformer::tileToSpherical.
+        highp vec3 terrainSpherePoint(vec3 pos) {
+            return uTerrainSphereOrigin + pos * uTerrainSphereScale;
+        }
+        // Unit sphere -> internal Mercator, matching SphericalProjectionSurface::SphericalToInternal.
+        // WORLD_SIZE / 2pi is folded into the uv uniforms, so this returns radians.
+        highp vec2 terrainSphereToMercator(highp vec3 p) {
+            highp float len = length(p);
+            highp float rz = clamp(p.z / len, -0.999999, 0.999999);
+            return vec2(atan(p.y, p.x), 0.5 * log((1.0 + rz) / (1.0 - rz)));
+        }
+        // The same inversion, RELATIVE to the vertex frame's own origin, and never forming the
+        // absolute point: a tile is 1e-5 of the sphere, so an fp32 o + d has already dropped it.
+        // Every uv uniform below is likewise relative, which is why none of them wraps (18-globe.md).
+        highp vec2 terrainSphereMercatorDelta(highp vec3 pos) {
+            highp vec3 o = uTerrainSphereOrigin;    // the frame origin, ON the unit sphere
+            highp vec3 d = pos * uTerrainSphereScale;
+            highp float od = dot(o, d), dd = dot(d, d);
+            highp float len = sqrt(1.0 + 2.0 * od + dd);
+            highp float lenM1 = (2.0 * od + dd) / (len + 1.0); // |o + d| - 1, without the cancellation
+            highp float dz = (d.z - o.z * lenM1) / len;        // sin(lat) difference, small by construction
+            // atanh(a) - atanh(b) = atanh((a - b) / (1 - a b)), and the series is what keeps the
+            // small case exact - log(1 + x) at x = 1e-4 throws away four of the seven digits.
+            highp float x = dz / max(1.0e-6, 1.0 - o.z * (o.z + dz));
+            highp float dMercY = abs(x) < 0.01 ? x * (1.0 + x * x * 0.33333333) : 0.5 * log((1.0 + x) / (1.0 - x));
+            // The cross and dot of o and o + d, expanded so both come out of d alone.
+            highp float dLon = atan(o.x * d.y - o.y * d.x, o.x * (o.x + d.x) + o.y * (o.y + d.y));
+            return vec2(dLon, dMercY);
+        }
+        // A vertex's offset from an origin the uv uniforms carry, both measured from the frame's.
+        // atan gives the longitude modulo 2pi, and a COARSE stand-in frame sits up to a world away
+        // in longitude - 63 of 81 vertices of a zoom-1 frame wrap. The answer is small either way,
+        // so the wrap costs nothing and without it the ground smeared at low zoom (18-globe.md).
+        highp vec2 terrainSphereRelative(highp vec3 pos, highp vec2 origin) {
+            highp vec2 merc = terrainSphereMercatorDelta(pos) - origin;
+            merc.x -= 6.283185307179586 * floor(merc.x * 0.15915494309189535 + 0.5);
+            return merc;
+        }
+        // Where a vertex sits in the TARGET tile, for the line clip.
+        highp vec2 terrainSphereTileUnit(highp vec3 pos) {
+            return terrainSphereRelative(pos, uTerrainSphereTileUV.xy) * uTerrainSphereTileUV.zw;
+        }
+        // The bake draws a vertex by WHERE IN THE TILE it is - its curved world position means
+        // nothing to a bake target that IS the tile's unit square. The matrix comes in because
+        // each shader declares its own.
+        highp vec4 drapeBakeClip(highp mat4 mvp, highp vec3 pos) {
+            return mvp * vec4(terrainSphereTileUnit(pos), 0.0, 1.0);
+        }
+        #endif
         #ifdef TERRAIN
         uniform highp sampler2D uElevationTexture;
         uniform highp vec4 uElevationUV;     // elevation texture uv = uv.xy + pos.xy * uv.zw
@@ -496,6 +592,15 @@ namespace massif::vt {
         uniform highp vec4 uElevationScale;  // x: meters to vertex z units (equator), y/z: mercator y = y + pos.y * z, w: vertex frame z offset
         uniform highp vec4 uElevationTexelSize; // xy: texture size in texels, zw: 1 / size
         uniform highp vec2 uElevationLatticeCell; // regular-grid surface cell size in NODE-uv units (0 = off = plain node sample)
+        #ifdef TERRAIN_SPHERICAL
+        // How far this vertex hangs below the surface: 0 everywhere but a skirt's bottom ring.
+        attribute highp float aVertexSkirt;
+        // DEM node uv from INTERNAL Mercator coordinates: uv = (internal - xy) * zw. Tile-local xy
+        // is a curved position on a sphere, so uElevationNodeUV's affine form cannot be used.
+        uniform highp vec4 uTerrainSphereNodeUV;
+        // The same, for the FULL elevation texture the fragment stage shades from.
+        uniform highp vec4 uTerrainSphereElevUV;
+        #endif
         uniform highp vec4 uTerrainEdgeCoarsening; // lattice cell scale (2^k, 1 = off) on the west/east/south/north tile edge
         // The NODE texture: the same DEM box-filtered to the surface lattice, one texel per mesh node.
         // The vertex stage displaces from THIS - point-sampling a lidar DEM aliases every relief finer
@@ -530,8 +635,20 @@ namespace massif::vt {
             return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
         }
         #endif
+        #ifdef TERRAIN_SPHERICAL
+        // The FULL elevation texture's uv, the same inversion the node one takes. The fragment
+        // stage shades and shadows from this texture, and its affine planar form read a curved
+        // xy as a flat one (18-globe.md).
+        highp vec2 terrainSphereElevUV(highp vec3 pos) {
+            return terrainSphereRelative(pos, uTerrainSphereElevUV.xy) * uTerrainSphereElevUV.zw;
+        }
+        #endif
         vec3 applyTerrain(vec3 pos) {
+        #ifdef TERRAIN_SPHERICAL
+            highp vec2 uv = terrainSphereRelative(pos, uTerrainSphereNodeUV.xy) * uTerrainSphereNodeUV.zw;
+        #else
             highp vec2 uv = uElevationNodeUV.xy + pos.xy * uElevationNodeUV.zw;
+        #endif
             float meters;
             if (uElevationLatticeCell.x != 0.0) {
                 // LATTICE CLAMP: interpolate the 4 surrounding node heights with the SAME two-triangle
@@ -565,9 +682,17 @@ namespace massif::vt {
             } else {
                 meters = nodeMeters(uv);
             }
+            // On a sphere y/z are 0, so cosh is 1: a height there is RADIAL and carries no
+            // Mercator stretch, unlike on the plane where this factor is the stretch.
             highp float my = uElevationScale.y + pos.y * uElevationScale.z;
             float coshMY = 0.5 * (exp(my) + exp(-my));
             float z = meters * uElevationScale.x * coshMY + uElevationScale.w;
+        #ifdef TERRAIN_SPHERICAL
+            // The drop arrives in its own attribute here, so the vertex keeps its curved position
+            // and the sphere point stays recoverable - unlike the flat encoding below, which
+            // REPLACES pos.z. Displacement is along the surface normal rather than along z.
+            return pos + normalize(terrainSpherePoint(pos)) * (z - aVertexSkirt);
+        #else
             if (pos.z < -900000.0) {
                 // tile skirt bottom vertex: z encodes -1000000 - drop; extrude downwards
                 // from the terrain surface to cover cracks between neighbouring tiles
@@ -575,6 +700,7 @@ namespace massif::vt {
                 z += pos.z + 1000000.0;
             }
             return vec3(pos.xy, z);
+        #endif
         }
         #else
         vec3 applyTerrain(vec3 pos) {
@@ -587,10 +713,20 @@ namespace massif::vt {
         #if defined(TERRAIN) && (defined(TERRAIN_SHADOW) || defined(GEOMETRY_LIGHT)) && !defined(TERRAIN_LIGHT)
         varying highp vec2 vElevUV;
         varying mediump float vElevCosh;
+        #ifdef TERRAIN_SPHERICAL
+        varying highp vec3 vSphereUp;
+        #endif
         void setTerrainSlopeVaryings(highp vec3 pos) {
+        #ifdef TERRAIN_SPHERICAL
+            vElevUV = terrainSphereElevUV(pos);
+            vSphereUp = normalize(terrainSpherePoint(pos));
+            highp float sphereMY = terrainSphereToMercator(terrainSpherePoint(pos)).y;
+            vElevCosh = 0.5 * (exp(sphereMY) + exp(-sphereMY));
+        #else
             vElevUV = uElevationUV.xy + pos.xy * uElevationUV.zw;
             highp float slopeMY = uElevationScale.y + pos.y * uElevationScale.z;
             vElevCosh = 0.5 * (exp(slopeMY) + exp(-slopeMY));
+        #endif
         }
         // A span is NOT on the ground, so it must not take the ground's normal - the deck would be
         // shaded by the valley wall under it. Zeroing the stretch flattens the gradient terrainNdl()
@@ -706,6 +842,24 @@ namespace massif::vt {
             return 1.0;
         }
         #endif
+        // A DEM slope normal is built in the LOCAL east/north/up, which on a globe is not the frame
+        // uSunDir lives in. Declared once here, for both the surface's own lighting and the slope
+        // path below (18-globe.md).
+        #if defined(TERRAIN) && defined(TERRAIN_SPHERICAL) && (defined(TERRAIN_SHADOW) || defined(GEOMETRY_LIGHT) || defined(TERRAIN_LIGHT))
+        uniform mediump mat3 uLightingFrame;
+        varying highp vec3 vSphereUp;
+        mediump vec3 groundLightNormal(mediump vec3 n) {
+            highp vec3 up = normalize(vSphereUp);
+            highp float h = max(1.0e-6, length(up.xy));
+            highp vec3 east = vec3(-up.y, up.x, 0.0) / h;
+            highp vec3 north = vec3(-up.z * up.x, -up.z * up.y, h) / h;
+            return (east * n.x + north * n.y + up * n.z) * uLightingFrame;
+        }
+        #else
+        mediump vec3 groundLightNormal(mediump vec3 n) {
+            return n;
+        }
+        #endif
         // The terrain normal at this fragment, for 2D content lit or shadowed by the ground with no
         // lighting of its own. Same stencil, uniforms and varyings as the surface takes, so a road and
         // its ground get the SAME N.L, the same slope-scaled bias and the same back-face rule.
@@ -739,7 +893,7 @@ namespace massif::vt {
             highp vec2 grad = grad0 + curv * f; // metres per texel
             highp float dx = grad.x * uTerrainSlopeScale.x * vElevCosh / duv.x;
             highp float dy = grad.y * uTerrainSlopeScale.y * vElevCosh / duv.y;
-            return max(0.0, dot(normalize(vec3(-dx, -dy, 1.0)), uSunDir));
+            return max(0.0, dot(groundLightNormal(normalize(vec3(-dx, -dy, 1.0))), uSunDir));
         }
         #else
         mediump float terrainNdl() {
@@ -1020,10 +1174,20 @@ namespace massif::vt {
         #if defined(TERRAIN_LIGHT) && defined(TERRAIN)
         varying highp vec2 vElevUV;
         varying mediump float vElevCosh;
+        #ifdef TERRAIN_SPHERICAL
+        varying highp vec3 vSphereUp;
+        #endif
         void setTerrainLightVaryings(highp vec3 pos) {
+        #ifdef TERRAIN_SPHERICAL
+            vElevUV = terrainSphereElevUV(pos);
+            vSphereUp = normalize(terrainSpherePoint(pos));
+            highp float sphereMY = terrainSphereToMercator(terrainSpherePoint(pos)).y;
+            vElevCosh = 0.5 * (exp(sphereMY) + exp(-sphereMY));
+        #else
             vElevUV = uElevationUV.xy + pos.xy * uElevationUV.zw;
             highp float lightMY = uElevationScale.y + pos.y * uElevationScale.z;
             vElevCosh = 0.5 * (exp(lightMY) + exp(-lightMY));
+        #endif
         }
         #else
         void setTerrainLightVaryings(highp vec3 pos) {
@@ -1065,13 +1229,17 @@ namespace massif::vt {
             // The regular-grid surface vertex xy is the tile-local [0,1] parametrization;
             // it is exactly the uv the tile's fills were baked into the drape texture with.
             // If fills appear vertically mirrored on device, flip to vec2(x, 1.0 - y).
+        #ifdef TERRAIN_SPHERICAL
+            vDrapeUV = uDrapeUVTransform.xy + terrainSphereTileUnit(aVertexPosition) * uDrapeUVTransform.zw;
+        #else
             vDrapeUV = uDrapeUVTransform.xy + aVertexPosition.xy * uDrapeUVTransform.zw;
         #endif
+        #endif
         #ifdef LIGHTING_VSH
-            vColor = applyLighting(vec4(1.0, 1.0, 1.0, 1.0), aVertexNormal);
+            vColor = applyLighting(vec4(1.0, 1.0, 1.0, 1.0), lightingNormal(aVertexNormal));
         #endif
         #ifdef LIGHTING_FSH
-            vNormal = aVertexNormal;
+            vNormal = lightingNormal(aVertexNormal);
         #endif
             highp vec3 terrainPos = applyTerrain(aVertexPosition);
             applyShadowPos(terrainPos);
@@ -1152,7 +1320,7 @@ namespace massif::vt {
             highp vec2 grad = grad0 + curv * f; // metres per texel
             highp float dx = grad.x * uTerrainSlopeScale.x * vElevCosh / duv.x;
             highp float dy = grad.y * uTerrainSlopeScale.y * vElevCosh / duv.y;
-            return normalize(vec3(-dx, -dy, 1.0));
+            return groundLightNormal(normalize(vec3(-dx, -dy, 1.0)));
         }
         #endif
     )GLSL";
@@ -1241,10 +1409,10 @@ namespace massif::vt {
             vUV = vec2(uUVMatrix * vec3(aVertexUV, 1.0));
             setTerrainLightVaryings(aVertexPosition);
         #ifdef LIGHTING_VSH
-            vColor = applyLighting(vec4(1.0, 1.0, 1.0, 1.0), aVertexNormal);
+            vColor = applyLighting(vec4(1.0, 1.0, 1.0, 1.0), lightingNormal(aVertexNormal));
         #endif
         #ifdef LIGHTING_FSH
-            vNormal = aVertexNormal;
+            vNormal = lightingNormal(aVertexNormal);
         #endif
             highp vec3 terrainPos = applyTerrain(aVertexPosition);
             applyShadowPos(terrainPos);
@@ -1318,8 +1486,8 @@ namespace massif::vt {
         void main(void) {
             vUV = vec2(uUVMatrix * vec3(aVertexUV, 1.0));
         #ifdef LIGHTING_FSH
-            vNormal = aVertexNormal;
-            vBinormal = aVertexBinormal;
+            vNormal = lightingNormal(aVertexNormal);
+            vBinormal = lightingNormal(aVertexBinormal);
         #endif
             highp vec3 terrainPos = applyTerrain(aVertexPosition);
             applyShadowPos(terrainPos);
@@ -1492,11 +1660,21 @@ namespace massif::vt {
         uniform mat4 uMVPMatrix;
         varying highp vec2 vElevUV;
         varying mediump float vElevCosh;
+        #ifdef TERRAIN_SPHERICAL
+        varying highp vec3 vSphereUp;
+        #endif
 
         void main(void) {
+        #ifdef TERRAIN_SPHERICAL
+            vElevUV = terrainSphereElevUV(aVertexPosition);
+            highp float sphereMY = terrainSphereToMercator(terrainSpherePoint(aVertexPosition)).y;
+            vElevCosh = 0.5 * (exp(sphereMY) + exp(-sphereMY));
+            vSphereUp = normalize(terrainSpherePoint(aVertexPosition));
+        #else
             vElevUV = uElevationUV.xy + aVertexPosition.xy * uElevationUV.zw;
             highp float my = uElevationScale.y + aVertexPosition.y * uElevationScale.z;
             vElevCosh = 0.5 * (exp(my) + exp(-my));
+        #endif
         #ifdef PAINT_SURFACE
             // Drawn as the terrain surface itself, displaced by the DEM - tangram's model, where
             // the hillshade is a draw on the tile's own terrain mesh rather than a texture baked
@@ -1547,7 +1725,7 @@ namespace massif::vt {
             highp vec2 st = uElevationTexelSize.zw;
             highp float dx = gTerrainGrad.x * uTerrainSlopeScale.x * vElevCosh / st.x;
             highp float dy = gTerrainGrad.y * uTerrainSlopeScale.y * vElevCosh / st.y;
-            return normalize(vec3(-dx, -dy, 1.0));
+            return groundLightNormal(normalize(vec3(-dx, -dy, 1.0)));
         }
         #endif
 
@@ -1670,14 +1848,14 @@ namespace massif::vt {
             // the style asks whatever raster size the label landed on.
             vAttribs = vec4(aVertexAttribs[1], uStrokeWidthTable[styleIndex], 0.0, uSDFRamp / size);
         #ifdef LIGHTING_VSH
-            vColor = applyLighting(color, aVertexNormal) * opacity;
-            vBorderColor = applyLighting(borderColor, aVertexNormal) * opacity;
+            vColor = applyLighting(color, lightingNormal(aVertexNormal)) * opacity;
+            vBorderColor = applyLighting(borderColor, lightingNormal(aVertexNormal)) * opacity;
         #else
             vColor = color * opacity;
             vBorderColor = borderColor * opacity;
         #endif
         #ifdef LIGHTING_FSH
-            vNormal = aVertexNormal;
+            vNormal = lightingNormal(aVertexNormal);
         #endif
             vec3 offset = aVertexAttribs[3] > 0.5
                 ? uLabelAxisX * aVertexOffset.x + uLabelAxisY * aVertexOffset.y
@@ -1818,12 +1996,12 @@ namespace massif::vt {
             // punch the ink out of it exactly as labelFsh does.
             vAttribs = vec4(aVertexAttribs[1], halo, offset, size / uSDFScale);
         #ifdef LIGHTING_VSH
-            vColor = applyLighting(color, aVertexNormal);
+            vColor = applyLighting(color, lightingNormal(aVertexNormal));
         #else
             vColor = color;
         #endif
         #ifdef LIGHTING_FSH
-            vNormal = aVertexNormal;
+            vNormal = lightingNormal(aVertexNormal);
         #endif
             // Sample the terrain at the EXTRUDED corner, as the line shader does: a quad placed at the
             // anchor's height and offset sideways is a flat plate, and on a slope its uphill half sits
@@ -1971,19 +2149,23 @@ namespace massif::vt {
             vBlur = 0.0;
         #endif
         #ifdef LIGHTING_VSH
-            vColor = applyLighting(color, aVertexNormal);
+            vColor = applyLighting(color, lightingNormal(aVertexNormal));
         #else
             vColor = color;
         #endif
         #ifdef LIGHTING_FSH
-            vNormal = aVertexNormal;
+            vNormal = lightingNormal(aVertexNormal);
         #endif
         #ifdef TERRAIN
             // Tangram's line model (extrude in model space, displace onto the terrain) with a CEILING:
             // their quad tapers with distance, which is right, but grows without bound towards the
             // camera. The shrink factor is <= 1 by construction, so it cannot enlarge a quad.
             setTerrainSlopeVaryings(pos);
+        #ifdef TERRAIN_SPHERICAL
+            vTileUnit = terrainSphereTileUnit(pos);
+        #else
             vTileUnit = pos.xy * uTileUnitScale + uTileUnitOffset;
+        #endif
             highp vec3 centerPos = applyTerrain(pos);
         #ifdef SPAN
             // A degenerate pair is the builder saying this span was CLIPPED by the tile, so its
@@ -2026,6 +2208,11 @@ namespace massif::vt {
             } else {
                 gl_Position = applyDepthBias(uMVPMatrix * vec4(edgePos, 1.0));
             }
+        #ifdef TERRAIN_SPHERICAL
+            if (uDrapeBake != 0.0) {
+                gl_Position = drapeBakeClip(uMVPMatrix, pos + delta);
+            }
+        #endif
         #else
             // sample the terrain at the extruded position, so wide lines follow the slope
             vTileUnit = pos.xy * uTileUnitScale + uTileUnitOffset;
@@ -2159,12 +2346,12 @@ namespace massif::vt {
             vUV = vec3(uUVScale * aVertexUV, uPatternTable[styleIndex]);
         #endif
         #ifdef LIGHTING_VSH
-            vColor = applyLighting(color, aVertexNormal);
+            vColor = applyLighting(color, lightingNormal(aVertexNormal));
         #else
             vColor = color;
         #endif
         #ifdef LIGHTING_FSH
-            vNormal = aVertexNormal;
+            vNormal = lightingNormal(aVertexNormal);
         #endif
             setTerrainSlopeVaryings(pos);
             highp vec3 terrainPos = applyTerrain(pos);
@@ -2176,6 +2363,11 @@ namespace massif::vt {
         #endif
             applyShadowPos(terrainPos);
             gl_Position = applyDepthBias(uMVPMatrix * vec4(terrainPos, 1.0));
+        #ifdef TERRAIN_SPHERICAL
+            if (uDrapeBake != 0.0) {
+                gl_Position = drapeBakeClip(uMVPMatrix, pos);
+            }
+        #endif
         }
     )GLSL";
 
@@ -2367,20 +2559,39 @@ namespace massif::vt {
         #ifdef TRANSFORM
             pos = vec3(uTransformMatrix * vec4(pos, 1.0));
         #endif
-            float groundZ = applyTerrain(pos).z;
-            float baseZ = groundZ;
-        #ifdef TERRAIN
+            vec3 groundPos = applyTerrain(pos);
+            vec3 basePos = groundPos;
             // Flat ground has one elevation everywhere, so the base IS the ground. An unresolved base
             // falls back to the ground under this vertex: a roof that shears down the slope, wrong but
             // visible - skipping the draw loses the building, and a base of 0 buries it.
+        #ifdef TERRAIN_SPHERICAL
+            // Up is the sphere normal, so the base is an offset ALONG it. Rebuilding a z-up vertex
+            // as the planar branch does put every building inside the globe (18-globe.md).
+            highp vec3 baseUp = normalize(terrainSpherePoint(pos));
+            // The tile clip below, taken BEFORE the extrusion moves the vertex: on a sphere a
+            // vertex xy is not its tile position, and the clip discarded every wall (18-globe.md).
+            highp vec2 sphereTileUnit = terrainSphereTileUnit(pos);
+        #ifdef TERRAIN
+            if ((aVertexHeight > 0.0 || uFloatingBase > 0.5) && aVertexBase > -1.0e29) {
+                basePos = pos + baseUp * (aVertexBase * uBaseScale + uElevationScale.w);
+            }
+        #endif
+        #else
+            float groundZ = groundPos.z;
+            float baseZ = groundZ;
+        #ifdef TERRAIN
             if ((aVertexHeight > 0.0 || uFloatingBase > 0.5) && aVertexBase > -1.0e29) {
                 baseZ = aVertexBase * uBaseScale + uElevationScale.w;
             }
         #endif
-            vec3 basePos = vec3(pos.xy, baseZ);
+            basePos = vec3(pos.xy, baseZ);
+        #endif
             pos = basePos + aVertexNormal * (aVertexHeight * uHeightScale);
             vec3 normal = normalize(mix(aVertexNormal, aVertexBinormal, sideVertex));
             applyShadowPos(basePos + aVertexNormal * (aVertexHeight * uShadowHeightScale), normal);
+            // The offset above is a WORLD one; everything the light touches from here is in the
+            // view's east/north/up, where a roof's z is 1 on a globe too.
+            normal = lightingNormal(normal);
         #ifdef TERRAIN_SHADOW
             vShadowNormal = normal;
         #endif
@@ -2388,8 +2599,12 @@ namespace massif::vt {
             // The overzoom clip, per VERTEX. Not on the centroid: a building can reach into a tile while
             // its centroid sits in another, and a centroid test then drops it from every tile that holds
             // it. Y is flipped back out of the transformer's frame - uTileMatrix works in tile space.
+        #ifdef TERRAIN_SPHERICAL
+            vTilePos = sphereTileUnit;
+        #else
             vec2 vertexTile = aVertexPosition.xy * uUVScale;
             vTilePos = (uTileMatrix * vec3(vertexTile.x, 1.0 - vertexTile.y, 1.0)).xy;
+        #endif
         #ifdef LIGHTING_VSH
             // Unshadowed: the shadow is a per-fragment term, so a per-vertex lighting still takes
             // it as a plain multiply in the fragment shader (and loses its ambient doing so).
@@ -2407,7 +2622,11 @@ namespace massif::vt {
         #endif
         #if defined(SPAN) && defined(TERRAIN)
             vSpanChord = aVertexChord;
+        #ifdef TERRAIN_SPHERICAL
+            vSpanAbove = dot(pos - groundPos, baseUp) / max(uBaseScale, 1.0e-6);
+        #else
             vSpanAbove = (pos.z - groundZ) / max(uBaseScale, 1.0e-6);
+        #endif
         #endif
             gl_Position = applyDepthBias(uMVPMatrix * vec4(pos, 1.0));
         }

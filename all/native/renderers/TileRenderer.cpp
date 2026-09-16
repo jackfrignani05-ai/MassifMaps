@@ -249,12 +249,10 @@ namespace massif {
         bool terrainMode = false;
         std::shared_ptr<TerrainOptions> activeTerrainOptions;
         if (auto options = _options.lock()) {
-            if (options->getRenderProjectionMode() == RenderProjectionMode::RENDER_PROJECTION_MODE_PLANAR) {
-                if (auto terrainOptions = options->getTerrainOptions()) {
-                    if (terrainOptions->isActive()) {
-                        terrainMode = true;
-                        activeTerrainOptions = terrainOptions;
-                    }
+            if (auto terrainOptions = options->getTerrainOptions()) {
+                if (terrainOptions->isActive()) {
+                    terrainMode = true;
+                    activeTerrainOptions = terrainOptions;
                 }
             }
         }
@@ -323,9 +321,15 @@ namespace massif {
         // a pan and snaps into place when the motion stops.
         cglib::mat4x4<double> prepareModelViewMat = viewState.getModelviewMat() * cglib::translate4_matrix(cglib::vec3<double>(_horizontalLayerOffset, 0, 0));
         vt::ViewState prepareViewState(viewState.getProjectionMat(), prepareModelViewMat, viewState.getRenderZoom(), viewState.getRotation(), viewState.getTilt(), viewState.getAspectRatio(), viewState.getNormalizedResolution());
+        // A label's world size is 2^-zoom of the WORLD, and vt scales it by the planar
+        // Const::WORLD_SIZE: the globe's own world is twice as wide, or labels come out half size.
+        prepareViewState.zoomScale *= static_cast<float>(viewState.worldPerInternal());
         prepareViewState.planarProjection = isPlanarProjectionMode();
         prepareViewState.labelPerspectiveScaling = _labelPerspectiveScaling;
         prepareViewState.lightBrightness = _resolvedBrightness;
+        // Missing here, vt fell back to the camera's height above the z=0 PLANE - right on a plane,
+        // and on a globe the camera's world z, which sized every label at the 0.05 floor.
+        prepareViewState.focusDistance = static_cast<float>(cglib::length(viewState.getCameraPos() - viewState.getFocusPos()));
         tileRenderer->setViewState(prepareViewState);
         tileRenderer->setGroundAO(_groundAOIntensity, _groundAOAttenuation);
         tileRenderer->setRadiance(_resolvedRadiance);
@@ -835,6 +839,7 @@ namespace massif {
 
         cglib::mat4x4<double> modelViewMat = viewState.getModelviewMat() * cglib::translate4_matrix(cglib::vec3<double>(_horizontalLayerOffset, 0, 0));
         vt::ViewState vtViewState(viewState.getProjectionMat(), modelViewMat, viewState.getRenderZoom(), viewState.getRotation(), viewState.getTilt(), viewState.getAspectRatio(), viewState.getNormalizedResolution());
+        vtViewState.zoomScale *= static_cast<float>(viewState.worldPerInternal());
         vtViewState.planarProjection = isPlanarProjectionMode(); // labels rescale by view depth, so neither terrain elevation nor a tilt blows up their screen size
         vtViewState.labelPerspectiveScaling = _labelPerspectiveScaling; // how much of that rescale is given back, so a distant label shrinks like maplibre's
         vtViewState.lightBrightness = _resolvedBrightness; // a style's view::brightness, so an emissive ramp over it follows the hour
@@ -855,7 +860,7 @@ namespace massif {
         float terrainDepthBias = 0.0f;
         std::shared_ptr<TerrainOptions> activeTerrainOptions;
         if (auto options = _options.lock()) {
-            if (options->getRenderProjectionMode() == RenderProjectionMode::RENDER_PROJECTION_MODE_PLANAR) {
+            {
                 if (auto terrainOptions = options->getTerrainOptions()) {
                     if (terrainOptions->isActive()) {
                         terrainMode = true;
@@ -1267,6 +1272,7 @@ namespace massif {
         }
         vt::ViewState cullViewState(viewState.getProjectionMat(), modelViewMat, viewState.getRenderZoom(),
 viewState.getRotation(), viewState.getTilt(), viewState.getAspectRatio(), viewState.getNormalizedResolution());
+        cullViewState.zoomScale *= static_cast<float>(viewState.worldPerInternal());
         cullViewState.planarProjection = isPlanarProjectionMode(); // keep culling envelopes consistent with the rendered label sizes
         cullViewState.labelPerspectiveScaling = _labelPerspectiveScaling;
         cullViewState.lightBrightness = _resolvedBrightness;
@@ -1410,6 +1416,7 @@ viewState.getRotation(), viewState.getTilt(), viewState.getAspectRatio(), viewSt
         cglib::mat4x4<double> modelViewMat = viewState.getModelviewMat();
         vt::ViewState vtViewState(viewState.getProjectionMat(), modelViewMat, viewState.getRenderZoom(),
 viewState.getRotation(), viewState.getTilt(), viewState.getAspectRatio(), viewState.getNormalizedResolution());
+        vtViewState.zoomScale *= static_cast<float>(viewState.worldPerInternal());
         vtViewState.lightBrightness = brightness;
         return Color(colorFunc(vtViewState).value());
     }
@@ -1423,6 +1430,7 @@ viewState.getRotation(), viewState.getTilt(), viewState.getAspectRatio(), viewSt
     float TileRenderer::evaluateFloatFunc(const vt::FloatFunction& floatFunc, const ViewState& viewState, float brightness) {
         cglib::mat4x4<double> modelViewMat = viewState.getModelviewMat();
         vt::ViewState vtViewState(viewState.getProjectionMat(), modelViewMat, viewState.getRenderZoom(), viewState.getRotation(), viewState.getTilt(), viewState.getAspectRatio(), viewState.getNormalizedResolution());
+        vtViewState.zoomScale *= static_cast<float>(viewState.worldPerInternal());
         vtViewState.lightBrightness = brightness;
         return floatFunc(vtViewState);
     }

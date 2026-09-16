@@ -622,7 +622,6 @@ namespace massif {
             // Calculate new focusPos, cameraPos and upVec
             cameraEvent.calculate(*_options, _viewState);
             _cameraPlaced = true;
-            _pannedSinceClearance = true;
     
             // Calculate parameters for kinetic events
             newFocusPos = projectionSurface->calculateMapPos(_viewState.getFocusPos());
@@ -1017,29 +1016,47 @@ namespace massif {
             terrainDecodeChanged = updateTerrainFlatten(deltaSeconds);
 
             // Terrain: extend view distances by the terrain height range and keep
-            // the camera above the terrain surface.
+            // the camera above the terrain surface. A position is turned into internal coordinates
+            // through the SURFACE - on a sphere its xyz is a point in 3D, not an x/y and a height.
             std::shared_ptr<ElevationManager> elevationManager;
-            if (_options->getRenderProjectionMode() == RenderProjectionMode::RENDER_PROJECTION_MODE_PLANAR) {
-                if (auto terrainOptions = _options->getTerrainOptions()) {
-                    if (terrainOptions->isEnabled()) {
-                        elevationManager = terrainOptions->getElevationManager();
-                    }
+            std::shared_ptr<TerrainOptions> focusTerrainOptions;
+            std::shared_ptr<ProjectionSurface> projectionSurface = _options->getProjectionSurface();
+            if (auto terrainOptions = _options->getTerrainOptions()) {
+                if (terrainOptions->isEnabled() && projectionSurface) {
+                    elevationManager = terrainOptions->getElevationManager();
+                    focusTerrainOptions = terrainOptions;
                 }
             }
             if (elevationManager) {
                 // The focus sits ON the ground, as in mapbox (transform._centerAltitude): the zoom
                 // is the camera's distance to the terrain there. The projection surface is planar, so
                 // every camera event drops the focus to sea level - lift it back whenever they differ.
+                // NEAR THE CLEARANCE SHELL ONLY (CameraClearance::focusFollow): pinned at every
+                // altitude, a pan across a ridge carried the whole camera up and down with it.
                 {
-                    const cglib::vec3<double>& focusPos = _viewState.getFocusPos();
+                    MapPos focusMapPos = projectionSurface->calculateMapPos(_viewState.getFocusPos());
+                    MapPos cameraMapPos = projectionSurface->calculateMapPos(_viewState.getCameraPos());
                     double terrainZ = 0;
-                    if (elevationManager->getDisplayHeightCached(focusPos(0), focusPos(1), terrainZ)) {
-                        _viewState.liftFocus(terrainZ - focusPos(2));
+                    if (elevationManager->getDisplayHeightCached(focusMapPos.getX(), focusMapPos.getY(), terrainZ)) {
+                        // Everything below is measured with the focus PINNED, so the lift it decides
+                        // cannot feed back into its own input and oscillate.
+                        double cameraTerrainZ = terrainZ;
+                        elevationManager->getDisplayHeightCached(cameraMapPos.getX(), cameraMapPos.getY(), cameraTerrainZ);
+                        double orbitHeight = cameraMapPos.getZ() - focusMapPos.getZ(); // invariant under the lift
+                        double pinnedCameraZ = terrainZ + orbitHeight;
+                        double clearanceFloor = focusTerrainOptions->getCameraClearance() * elevationManager->getDisplayScale(cameraMapPos.getY());
+                        double maxZoomOrbit = _viewState.getOrbitDistance(_options->getZoomRange().getMax()) / _viewState.worldPerInternal();
+                        double minHeight = CameraClearance::minHeight(pinnedCameraZ, maxZoomOrbit, clearanceFloor);
+                        double follow = CameraClearance::focusFollow(pinnedCameraZ - cameraTerrainZ, minHeight);
+                        // ... and never below the shell: the focus RAISES the camera, which keeps the
+                        // tilt and the zoom the user set. Correcting by tilting jumped the view.
+                        double shellFocusZ = CameraClearance::shellCameraZ(cameraTerrainZ, maxZoomOrbit, clearanceFloor) - orbitHeight;
+                        _viewState.setFocusHeight(std::max(terrainZ * follow, shellFocusZ));
                     }
                 }
-                cglib::vec3<double> cameraPos = _viewState.getCameraPos();
+                MapPos cameraMapPos = projectionSurface->calculateMapPos(_viewState.getCameraPos());
                 double minZ = 0, maxZ = 0;
-                elevationManager->getDisplayHeightRange(cameraPos(1), minZ, maxZ);
+                elevationManager->getDisplayHeightRange(cameraMapPos.getY(), minZ, maxZ);
                 _viewState.setTerrainHeightRange(static_cast<float>(minZ), static_cast<float>(maxZ));
 
                 // The camera is deliberately NOT clamped above the terrain here: ViewState keeps
@@ -1278,13 +1295,11 @@ namespace massif {
         // Optional terrain depth pre-pass (renders into its own FBO and restores the binding)
         GLuint terrainDepthTex = 0;
         if (effect->isTerrainDepthRequired()) {
-            std::shared_ptr<TerrainOptions> terrainOptions;
-            if (_options->getRenderProjectionMode() == RenderProjectionMode::RENDER_PROJECTION_MODE_PLANAR) {
-                terrainOptions = _options->getTerrainOptions();
-            }
+            std::shared_ptr<TerrainOptions> terrainOptions = _options->getTerrainOptions();
             if (terrainOptions && terrainOptions->isActive()) {
                 if (!_terrainRenderer) {
                     _terrainRenderer = std::make_unique<TerrainRenderer>();
+                    _terrainRenderer->setTileTransformer(_options->getTileTransformer());
                 }
                 // Full mesh resolution: an effect drawing lines from this depth would otherwise
                 // draw the coarse depth mesh's own triangulation.
@@ -1553,14 +1568,13 @@ namespace massif {
             return std::numeric_limits<double>::infinity();
         }
         double halfWidth = _viewState.getHalfWidth(), halfHeight = _viewState.getHalfHeight();
-        return AutoFlatten::parallax(std::sqrt(halfWidth * halfWidth + halfHeight * halfHeight), maxZ - minZ, _viewState.calculateCameraDistance());
+        // The height range is INTERNAL, the camera distance is WORLD, and the globe's world is
+        // twice the plane's - so the two only compare after the conversion (18-globe.md).
+        return AutoFlatten::parallax(std::sqrt(halfWidth * halfWidth + halfHeight * halfHeight), (maxZ - minZ) * _viewState.worldPerInternal(), _viewState.calculateCameraDistance());
     }
 
     bool MapRenderer::updateTerrainFlatten(float deltaSeconds) {
-        std::shared_ptr<TerrainOptions> terrainOptions;
-        if (_options->getRenderProjectionMode() == RenderProjectionMode::RENDER_PROJECTION_MODE_PLANAR) {
-            terrainOptions = _options->getTerrainOptions();
-        }
+        std::shared_ptr<TerrainOptions> terrainOptions = _options->getTerrainOptions();
         if (!terrainOptions || !terrainOptions->isEnabled()) {
             return false;
         }
@@ -1656,6 +1670,11 @@ namespace massif {
         }
         _flattenSwitchState = next;
         terrainOptions->setSwitching(FlattenSwitch::isWaitingForTiles(next, input));
+        if (next.phase == FlattenSwitch::Phase::RAMPING) {
+            // The ramp runs on a CLOCK, and the frame it starts on has no delta yet - so its first
+            // step moves nothing, and without this nothing asks for the frame that would move it.
+            requestRedraw();
+        }
         if (!decodeChanged && !ratioChanged) {
             return false;
         }
@@ -2404,10 +2423,16 @@ namespace massif {
         // surfaces, so the depth is bit-exact with the rendered terrain and nothing mesh-mismatches.
         // With no tile layer at all, an approximate depth pre-pass stands in.
         bool terrainMode = false;
-        if (_options->getRenderProjectionMode() == RenderProjectionMode::RENDER_PROJECTION_MODE_PLANAR) {
+        {
             if (auto terrainOptions = _options->getTerrainOptions()) {
                 if (terrainOptions->isActive()) {
                     terrainMode = true;
+                    // Every frame, not just at creation: a projection switch replaces the
+                    // transformer without replacing the renderer, and a cached mesh carries the
+                    // shape of the surface it was built on. The setter is a no-op when unchanged.
+                    if (_terrainRenderer) {
+                        _terrainRenderer->setTileTransformer(_options->getTileTransformer());
+                    }
                     // Elevation arrives on a loading thread and every consumer reads it from
                     // inside a frame, so the tiles that land after the last one are never
                     // applied: the map sits on a half-displaced mesh until the next gesture.
@@ -2445,6 +2470,7 @@ namespace massif {
                     {
                         if (!_terrainRenderer) {
                             _terrainRenderer = std::make_unique<TerrainRenderer>();
+                    _terrainRenderer->setTileTransformer(_options->getTileTransformer());
                         }
                         bool keepDepth = !depthWriteAssigned;
                         bool backgroundRendered = false;
@@ -2489,6 +2515,7 @@ namespace massif {
                         // Pixel-exact terrain depth buffer for label/billboard occlusion tests
                         if (!_terrainRenderer) {
                             _terrainRenderer = std::make_unique<TerrainRenderer>();
+                    _terrainRenderer->setTileTransformer(_options->getTileTransformer());
                         }
                         _terrainRenderer->updateDepthBuffer(viewState, terrainOptions, _glResourceManager);
                         if (_terrainRenderer->isDepthBufferStale()) {
@@ -2504,51 +2531,17 @@ namespace massif {
                     // (transform._constrainCamera), see docs/internals/rendering/04-terrain.md.
                     {
                         std::shared_ptr<ElevationManager> elevationManager = terrainOptions->getElevationManager();
-                        float clampDuration = terrainOptions->getCameraClampDuration();
-                        cglib::vec3<double> cameraPos = viewState.getCameraPos();
-                        double displayScale = elevationManager->getDisplayScale(cameraPos(1));
-                        double terrainZ = elevationManager->getDisplayHeight(cameraPos(0), cameraPos(1), ElevationManager::LoadMode::CACHED_ONLY);
+                        // Through the surface: a camera position is a point in 3D on a globe, and an
+                        // ORBIT is a world length where a height is an internal one - 2x apart there.
+                        std::shared_ptr<ProjectionSurface> clearanceSurface = _options->getProjectionSurface();
+                        MapPos cameraMapPos = (clearanceSurface ? clearanceSurface->calculateMapPos(viewState.getCameraPos()) : MapPos());
+                        double worldPerInternalZ = viewState.worldPerInternal();
+                        double displayScale = elevationManager->getDisplayScale(cameraMapPos.getY());
+                        double terrainZ = elevationManager->getDisplayHeight(cameraMapPos.getX(), cameraMapPos.getY(), ElevationManager::LoadMode::CACHED_ONLY);
                         double clearanceFloor = terrainOptions->getCameraClearance() * displayScale;
-                        {
+                        if (clearanceSurface) {
                             std::lock_guard<std::recursive_mutex> lock(_mutex);
                             _viewState.setTerrainCameraReference(terrainZ, clearanceFloor);
-                        }
-                        bool panned = _pannedSinceClearance.exchange(false);
-                        double focusZ = viewState.getFocusPos()(2);
-                        double orbit = viewState.getOrbitDistance(viewState.getZoom());
-                        double maxZoomOrbit = viewState.getOrbitDistance(_options->getZoomRange().getMax());
-                        double minHeight = CameraClearance::minHeight(cameraPos(2), maxZoomOrbit, clearanceFloor);
-                        double cameraHeight = cameraPos(2) - terrainZ;
-                        double deadBand = 0.005 * minHeight;
-                        if (orbit > 0 && cameraHeight < minHeight - deadBand && (panned || cameraHeight < 0)) {
-                            // The height above the focus that puts the camera on the shell, and the
-                            // tilt that gives it (tilt 90 is straight down); past the tilt range's
-                            // top the rest comes from zooming out, about the focus.
-                            MapRange tiltRange = _options->getTiltRange();
-                            double maxTiltSin = std::sin(tiltRange.getMax() * Const::DEG_TO_RAD);
-                            double targetHeight = CameraClearance::targetHeight(focusZ, terrainZ, maxZoomOrbit, clearanceFloor);
-                            float tilt = viewState.getTilt();
-                            if (targetHeight <= orbit * maxTiltSin) {
-                                tilt = static_cast<float>(std::asin(std::max(0.0, targetHeight / orbit)) * Const::RAD_TO_DEG);
-                            } else {
-                                tilt = tiltRange.getMax();
-                                float maxZoom = CameraClearance::maxZoom(viewState.getZoom(), focusZ, focusZ + orbit * maxTiltSin, terrainZ,
-                                                                         maxZoomOrbit, clearanceFloor);
-                                float zoom = std::max(maxZoom, _options->getZoomRange().getMin());
-                                if (zoom < viewState.getZoom() - 1.0e-4f) {
-                                    CameraZoomEvent zoomEvent;
-                                    zoomEvent.setZoomDelta(zoom - viewState.getZoom());
-                                    // API, not GESTURE: the SDK corrects the camera here, and it does so
-                                    // after a programmatic move just as much as after a gesture.
-                                    calculateCameraEvent(zoomEvent, clampDuration, false, MapMoveReason::MAP_MOVE_REASON_API);
-                                }
-                            }
-                            if (tilt > viewState.getTilt() + 1.0e-3f) {
-                                CameraTiltEvent tiltEvent;
-                                tiltEvent.setKeepRotation(true);
-                                tiltEvent.setTilt(tilt);
-                                calculateCameraEvent(tiltEvent, clampDuration, false, MapMoveReason::MAP_MOVE_REASON_API);
-                            }
                         }
                     }
                 }
@@ -3410,8 +3403,10 @@ namespace massif {
                     bakeSome(partialTiles, DRAPE_BAKE_BUDGET_PARTIAL);
                     // One stale tile per frame is the right ration while the camera moves. On a map at
                     // REST it is a livelock: only the bakes themselves ask for frames, so a backlog
-                    // drains over half a minute. At rest the wall-clock budget rations it instead.
-                    bakeSome(staleTiles, bakeCameraMoving ? DRAPE_BAKE_BUDGET_STALE : DRAPE_BAKE_BUDGET_BLANK);
+                    // drains over half a minute. At rest the wall-clock budget rations it instead -
+                    // and with NO count ceiling, because there the whole cover goes stale at once (the
+                    // sun crossing a light step) and a count repaints the ground in front of the user.
+                    bakeSome(staleTiles, bakeCameraMoving ? DRAPE_BAKE_BUDGET_STALE : static_cast<int>(staleTiles.size()));
 
                     // Baking is rationed over several frames, so it only finishes if those frames
                     // happen - and nothing else asks for them once the map goes idle. Keep asking

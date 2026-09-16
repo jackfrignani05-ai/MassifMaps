@@ -31,8 +31,6 @@ namespace massif::vt {
         // where the evaluation is PER LABEL - the culler's ranking pass - since the renderer evaluates a
         // style function once per batch and a per-label value there would break batching.
         float labelDistance = 0;
-        // Planar render projection, with or without 3D terrain. Labels then keep a CONSTANT ON-SCREEN
-        // SIZE (tangram-style) and snap to the pixel grid; terrain only made it visible.
 
         // mapbox's ["measure-light", "brightness"]: how bright the scene light is, 0-1. A style reads it
         // as `view::brightness`, resolved per frame, so a label dims with the hour without a re-decode.

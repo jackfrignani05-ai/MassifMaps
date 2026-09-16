@@ -90,6 +90,13 @@ set(TEST_SDK_SOURCES
   "${SDK_BASE_DIR}/all/native/projections/Projection.cpp"
   "${SDK_BASE_DIR}/all/native/projections/EPSG3857.cpp"
   "${SDK_BASE_DIR}/all/native/projections/EPSG4326.cpp"
+  # The two projection surfaces, for SphericalSurfaceTest. They need Const, MapPos, MapVec and
+  # cglib and nothing else - no Options, no renderer, so the link stays as small as it was.
+  "${SDK_BASE_DIR}/all/native/projections/PlanarProjectionSurface.cpp"
+  "${SDK_BASE_DIR}/all/native/projections/SphericalProjectionSurface.cpp"
+  # vt's tile frames, for GlobeElevationScaleTest. cglib and boost's constants and nothing else -
+  # no GL, no renderer.
+  "${SDK_BASE_DIR}/libs-massif/vt/src/vt/TileTransformer.cpp"
   # Spec.cpp holds create() and the registry; the built-in factories live in SpecFactories.cpp,
   # which is deliberately NOT here - linking it would need every source and layer constructor.
   "${SDK_BASE_DIR}/all/native/api/Spec.cpp"
@@ -236,6 +243,21 @@ add_executable(api_tests
   TileStyleZoomTest.cpp
   # Same: TileLODRule.h is maplibre's tile zoom function as two corrections, and nothing else.
   TileLODRuleTest.cpp
+  # The globe's surface against the planar one - the conventions terrain-on-globe rests on.
+  # Needs the two projection surface sources added above.
+  SphericalSurfaceTest.cpp
+  # Same: TerrainElevationScale.h is metres-to-vertex-frame on a sphere and nothing else. Needs
+  # vt's TileTransformer source added above.
+  GlobeElevationScaleTest.cpp
+  # Same: SkyFrame.h is the sky's observer rotation and camera height, and nothing else. It was
+  # split out of SkyRenderer precisely so it could be reached from here - the renderer itself
+  # needs GL.
+  SkyFrameTest.cpp
+  # The terrain surface as a decorator over the plane and over the globe. It takes the light
+  # ElevationProvider interface, so a synthetic height field stands in for the manager, which
+  # needs the data source and the grid cache and does not link here.
+  TerrainSurfaceTest.cpp
+  "${SDK_BASE_DIR}/all/native/terrain/TerrainProjectionSurface.cpp"
   "${TEST_TABLE_DIR}/PropertyTable.inc"
   "${TEST_TABLE_DIR}/MethodDecls.inc"
   "${TEST_SCHEMA_DIR}/massif-api.json"
