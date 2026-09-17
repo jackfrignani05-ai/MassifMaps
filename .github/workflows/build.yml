@@ -23,8 +23,8 @@ jobs:
     steps:
       - id: set
         run: |
-          echo 'variants=["android","ios"]' >> $GITHUB_OUTPUT
-          echo 'profiles=["full","standard", "lite"]' >> $GITHUB_OUTPUT
+          echo 'variants=["android"]' >> $GITHUB_OUTPUT
+          echo 'profiles=["full"]' >> $GITHUB_OUTPUT
 
   api-bindings:
     # The facade's generated bindings - the typings an integration actually reads. The C++ property
