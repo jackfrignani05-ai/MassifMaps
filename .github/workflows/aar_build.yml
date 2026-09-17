@@ -223,6 +223,8 @@ jobs:
       - name: Setup Android SDK
         if: matrix.variant == 'android'
         uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
 
       # - if: matrix.variant == 'android'
       #   name: run SDKManager
@@ -442,6 +444,8 @@ jobs:
       - name: Setup Android SDK
         if: matrix.variant == 'android'
         uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
 
       - uses: nttld/setup-ndk@v1.6.0
         if: matrix.variant == 'android'
