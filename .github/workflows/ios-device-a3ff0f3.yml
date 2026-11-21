@@ -1,0 +1,37 @@
+name: Massif a3ff0f3 iPhone SDK
+
+on:
+  push:
+    branches:
+      - codex/massif-a3ff0f3-ios-device
+    paths:
+      - .github/workflows/ios-device-a3ff0f3.yml
+      - scripts/build-pinned-ios-device.sh
+
+permissions:
+  contents: read
+
+jobs:
+  sdk:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: massif-maps/MassifMaps
+          ref: a3ff0f34946748522014bb19421ed72e57e51eb2
+          path: source
+          persist-credentials: false
+      - run: bash scripts/build-pinned-ios-device.sh "$PWD/source" "$RUNNER_TEMP/massif-ios-device"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: massif-ios-a3ff0f3-device
+          path: ${{ runner.temp }}/massif-ios-device
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
